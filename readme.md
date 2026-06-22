@@ -50,7 +50,7 @@ SkyFive's Backend is built on **AWS** and designed as *fully serverless* infrast
     * **Stack Name** (default: `skyfive-stack`)
     * **AWS Region** (default: `us-east-1`)
     * **LambdaRoleArn:** ARN of a lambda IAM role to apply to all lambdas.
-    * *Requires permissions for basic Lambda execution, DynamoDB CRUD, Cognito UserPools Read, and SNS Access*.
+        * *Requires permissions for basic Lambda execution, DynamoDB CRUD, Cognito UserPools Read, and SNS Access*.
     * **GoogleClientId** (from Step 1).
     * **GoogleClientSecret** (from Step 1).
     * **AdminEmail** (Admin email to receive satellite event alerts).
