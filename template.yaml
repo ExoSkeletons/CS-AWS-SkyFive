@@ -1,0 +1,814 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: SAM Template for SkyFive Serverless Application
+
+Parameters:
+  LambdaRoleArn:
+    Type: String
+    Description: The ARN of the IAM Role used for Lambda execution.
+  GoogleClientId:
+    Type: String
+    Description: Google OAuth Client ID for Cognito
+  GoogleClientSecret:
+    Type: String
+    NoEcho: true
+    Description: Google OAuth Client Secret for Cognito
+  AdminEmail:
+    Type: String
+    Description: Admin email for SNS subscriptions
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+    Tags:
+      skyfive: ''
+    Environment:
+      Variables:
+        HF_TABLE_NAME: !Ref DynamoDBTableSatTravellers
+        HIGHFIVES_TABLE_NAME: !Ref DynamoDBTableHighfives
+        SAT_EVENTS_TOPIC_NAME: !GetAtt SNSTopicSatEvents.TopicName
+        TLE_CACHE_TABLE_NAME: !Ref DynamoDBTableSatTleCache
+        ADMIN_USER_GROUP_NAME: !Ref CognitoUserPoolGroupAdmin
+        PAID_USER_GROUP_NAME: !Ref CognitoUserPoolGroupPaid
+
+Resources:
+  # ==========================================
+  # API Gateway
+  # ==========================================
+  SkyFiveApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: dev
+      OpenApiVersion: 3.0.1
+      Name: SkyFiveApi
+
+      Cors:
+        AllowMethods: '''*'''
+        AllowHeaders: '''Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'''
+        AllowOrigin: '''*'''
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: '''*'''
+              Access-Control-Allow-Headers: '''Content-Type,X-Amz-Date,Authorization,X-Api-Key'''
+              Access-Control-Allow-Methods: '''*'''
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: '''*'''
+              Access-Control-Allow-Headers: '''Content-Type,X-Amz-Date,Authorization,X-Api-Key'''
+              Access-Control-Allow-Methods: '''*'''
+
+      Auth:
+        Authorizers:
+          CognitoAuth:
+            UserPoolArn: !GetAtt CognitoUserPool.Arn
+            Identity:
+              Header: Authorization
+              ValidationExpression: .*
+
+      Models:
+        Empty:
+          type: object
+          title: Empty Schema
+        HighFiveInfo:
+          type: object
+          description: ''
+          required:
+            - from
+          properties:
+            from:
+              type: object
+              required:
+                - location
+              properties:
+                location:
+                  type: object
+                  required:
+                    - altitude
+                    - latitude
+                    - longitude
+                  properties:
+                    latitude:
+                      type: number
+                    longitude:
+                      type: number
+                    altitude:
+                      type: number
+                username:
+                  type: string
+                  minLength: 1
+
+  # ==========================================
+  # Cognito Identity Platform
+  # ==========================================
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: SkyFive-UserPool
+      UserPoolTags:
+        skyfive: ''
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: nickname
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+
+  CognitoUserPoolGroupAdmin:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: admin
+      Description: "Users with administrative privileges"
+      UserPoolId: !Ref CognitoUserPool
+  CognitoUserPoolGroupPaid:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: paid
+      Description: "Users who paid for extra features"
+      UserPoolId: !Ref CognitoUserPool
+
+  CognitoIdentityProviderGoogle:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Properties:
+      ProviderName: Google
+      ProviderType: Google
+      UserPoolId: !Ref CognitoUserPool
+      ProviderDetails:
+        client_id: !Ref GoogleClientId
+        client_secret: !Ref GoogleClientSecret
+        authorize_scopes: profile email openid
+      AttributeMapping:
+        email: email
+        username: sub
+        nickname: name
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: CognitoIdentityProviderGoogle
+    Properties:
+      ClientName: SkyFive App Client
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      SupportedIdentityProviders:
+        - COGNITO
+        - Google
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+        - phone
+      CallbackURLs:
+        - !Sub https://${WebsiteDistribution.DomainName}/callback.html
+      LogoutURLs:
+        - !Sub https://${WebsiteDistribution.DomainName}/logout.html
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub skyfive-${AWS::AccountId} # Unique
+      UserPoolId: !Ref CognitoUserPool
+
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub aws-cs-final-skyfive-${AWS::AccountId}-${AWS::Region}
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      Tags:
+        - Key: skyfive
+          Value: ''
+
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Description: OAC for SkyFive Static Website
+        Name: !Sub skyfive-oac-${AWS::StackName}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  WebsiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${WebsiteBucket}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebsiteDistribution}
+
+  # ==========================================
+  # DynamoDB Tables
+  # ==========================================
+  DynamoDBTableSatTleCache:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: sat-tle-cache
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: norad_id
+          AttributeType: 'N'
+      KeySchema:
+        - AttributeName: norad_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: expires
+      Tags:
+        - Key: skyfive
+          Value: ''
+
+  DynamoDBTableSatTravellers:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: sat-travellers
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: norad_id
+          AttributeType: 'N'
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: norad_id
+          KeyType: HASH
+        - AttributeName: user_id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: ByUsers
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: norad_id
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: ttl
+      Tags:
+        - Key: skyfive
+          Value: ''
+
+  DynamoDBTableHighfives:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: user-highfives
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: giver_id
+          AttributeType: S
+        - AttributeName: receiver_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: 'N'
+      KeySchema:
+        - AttributeName: timestamp
+          KeyType: HASH
+        - AttributeName: giver_id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GiverIndex
+          KeySchema:
+            - AttributeName: giver_id
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ReceiverIndex
+          KeySchema:
+            - AttributeName: receiver_id
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: expiration
+      Tags:
+        - Key: skyfive
+          Value: ''
+
+  # ==========================================
+  # SNS & S3 Storage
+  # ==========================================
+  SNSTopicSatEvents:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: sat-events
+      Subscription:
+        - Endpoint: !Ref AdminEmail
+          Protocol: email
+      Tags:
+        - Key: skyfive
+          Value: ''
+
+  # ==========================================
+  # Lambda Layers
+  # ==========================================
+  SatDataLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: satdata
+      Description: Satellite core data manipulation layer
+      ContentUri: ./lambda/layers/satdata
+      CompatibleRuntimes:
+        - python3.12
+    Metadata:
+      BuildMethod: python3.12
+      AWS::Composer::ConnectsTo:
+        - LocalResourceId: DynamoDBTableSatTleCache
+
+  SatMathLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: satmath
+      Description: Mathematical calculations and orbit modeling layer
+      ContentUri: ./lambda/layers/satmath
+      CompatibleRuntimes:
+        - python3.12
+    Metadata:
+      BuildMethod: python3.12
+
+  AwsUtilLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: awsutils
+      Description: AWS Cross-cutting concerns utilities layer
+      ContentUri: ./lambda/layers/awsutils
+      CompatibleRuntimes:
+        - python3.12
+    Metadata:
+      BuildMethod: python3.12
+
+  # ==========================================
+  # Lambda Functions
+  # ==========================================
+  LambdaSatPathPredict:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: sat-path-predict
+      Role: !Ref LambdaRoleArn
+      CodeUri: ./lambda/src/sat-path-predict
+      Handler: lambda_function.lambda_handler
+      MemorySize: 512
+      Timeout: 60
+      Layers:
+        - !Ref SatDataLayer
+        - !Ref SatMathLayer
+        - !Ref AwsUtilLayer
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SkyFiveApi
+            Path: /sat/{norad_id}/path
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuth
+
+  LambdaUserGetTrackedSats:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: sats-by-user
+      Role: !Ref LambdaRoleArn
+      CodeUri: ./lambda/src/sats-by-user
+      Handler: lambda_function.lambda_handler
+      MemorySize: 128
+      Timeout: 3
+      Layers:
+        - !Ref AwsUtilLayer
+      Events:
+        MySatsEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SkyFiveApi
+            Path: /my/sats
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuth
+        UserSatsEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SkyFiveApi
+            Path: /u/{user_id}
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuth
+      Environment:
+        Variables:
+          DYNAMODBTABLESATTRAVELLERS_TABLE_NAME: !Ref DynamoDBTableSatTravellers
+          DYNAMODBTABLESATTRAVELLERS_TABLE_ARN: !GetAtt DynamoDBTableSatTravellers.Arn
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTableSatTravellers
+
+  LambdaHighfive:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: highfive
+      Role: !Ref LambdaRoleArn
+      CodeUri: ./lambda/src/highfive
+      Handler: lambda_function.lambda_handler
+      MemorySize: 128
+      Timeout: 15
+      Layers:
+        - !Ref AwsUtilLayer
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SkyFiveApi
+            Path: /sat/{norad_id}/highfive
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuth
+            RequestModel:
+              Model: HighFiveInfo
+              Required: true
+              ValidateBody: true
+              ValidateParameters: true
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt SNSTopicSatEvents.TopicName
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt SNSTopicSatEvents.TopicName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTableHighfives
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTableSatTravellers
+      Environment:
+        Variables:
+          SNSTOPICSATEVENTS_TOPIC_NAME: !GetAtt SNSTopicSatEvents.TopicName
+          SNSTOPICSATEVENTS_TOPIC_ARN: !Ref SNSTopicSatEvents
+          DYNAMODBTABLEHIGHFIVES_TABLE_NAME: !Ref DynamoDBTableHighfives
+          DYNAMODBTABLEHIGHFIVES_TABLE_ARN: !GetAtt DynamoDBTableHighfives.Arn
+          DYNAMODBTABLESATTRAVELLERS_TABLE_NAME: !Ref DynamoDBTableSatTravellers
+          DYNAMODBTABLESATTRAVELLERS_TABLE_ARN: !GetAtt DynamoDBTableSatTravellers.Arn
+
+  LambdaGetSatTravellers:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: users-by-sat
+      Role: !Ref LambdaRoleArn
+      CodeUri: ./lambda/src/users-by-sat
+      Handler: lambda_function.lambda_handler
+      MemorySize: 128
+      Timeout: 3
+      Layers:
+        - !Ref AwsUtilLayer
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SkyFiveApi
+            Path: /sat/{norad_id}/travellers
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuth
+            RequestParameters:
+              - method.request.path.norad_id:
+                  Required: true
+      Environment:
+        Variables:
+          DYNAMODBTABLESATTRAVELLERS_TABLE_NAME: !Ref DynamoDBTableSatTravellers
+          DYNAMODBTABLESATTRAVELLERS_TABLE_ARN: !GetAtt DynamoDBTableSatTravellers.Arn
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTableSatTravellers
+
+  LambdaUpdateSatRider:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: update-sat-rider
+      Role: !Ref LambdaRoleArn
+      CodeUri: ./lambda/src/update-sat-rider
+      Handler: lambda_function.lambda_handler
+      MemorySize: 128
+      Timeout: 10
+      Layers:
+        - !Ref SatDataLayer
+        - !Ref AwsUtilLayer
+      Events:
+        PutTravellers:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SkyFiveApi
+            Path: /sat/{norad_id}/travellers
+            Method: PUT
+            Auth:
+              Authorizer: CognitoAuth
+            RequestParameters:
+              - method.request.path.norad_id:
+                  Required: true
+        PostTravellers:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SkyFiveApi
+            Path: /sat/{norad_id}/travellers
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuth
+            RequestParameters:
+              - method.request.path.norad_id:
+                  Required: true
+        DeleteTravellers:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SkyFiveApi
+            Path: /sat/{norad_id}/travellers
+            Method: DELETE
+            Auth:
+              Authorizer: CognitoAuth
+            RequestParameters:
+              - method.request.path.norad_id:
+                  Required: true
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTableSatTravellers
+      Environment:
+        Variables:
+          DYNAMODBTABLESATTRAVELLERS_TABLE_NAME: !Ref DynamoDBTableSatTravellers
+          DYNAMODBTABLESATTRAVELLERS_TABLE_ARN: !GetAtt DynamoDBTableSatTravellers.Arn
+
+  LambdaNearby:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: nearby
+      Role: !Ref LambdaRoleArn
+      CodeUri: ./lambda/src/nearby
+      Handler: lambda_function.lambda_handler
+      MemorySize: 512
+      Timeout: 3
+      Layers:
+        - !Ref SatDataLayer
+        - !Ref SatMathLayer
+        - !Ref AwsUtilLayer
+      Events:
+        SatNearbyEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SkyFiveApi
+            Path: /sat/nearby
+            Method: GET
+            RequestParameters:
+              - method.request.querystring.longitude:
+                  Required: true
+              - method.request.querystring.latitude:
+                  Required: true
+
+  LambdaSatInfo:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: sat-info
+      Role: !Ref LambdaRoleArn
+      CodeUri: ./lambda/src/sat-info
+      Handler: lambda_function.lambda_handler
+      MemorySize: 256
+      Timeout: 10
+      Layers:
+        - !Ref SatDataLayer
+        - !Ref AwsUtilLayer
+        - !Ref SatMathLayer
+      Events:
+        GetSatInfo:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SkyFiveApi
+            Path: /sat/{norad_id}
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuth
+            RequestParameters:
+              - method.request.path.norad_id:
+                  Required: true
+        DeleteSatInfo:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SkyFiveApi
+            Path: /sat/{norad_id}
+            RequestParameters:
+              - method.request.path.norad_id:
+                  Required: true
+            Method: DELETE
+            Auth:
+              Authorizer: CognitoAuth
+      Environment:
+        Variables:
+          DYNAMODBTABLESATTLECACHE_TABLE_NAME: !Ref DynamoDBTableSatTleCache
+          DYNAMODBTABLESATTLECACHE_TABLE_ARN: !GetAtt DynamoDBTableSatTleCache.Arn
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTableSatTleCache
+
+  LambdaGetHighfives:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: get-highfives
+      Role: !Ref LambdaRoleArn
+      Description: !Sub
+        - Stack ${AWS::StackName} Function ${ResourceName}
+        - ResourceName: LambdaGetHighfives
+      CodeUri: lambda/src/get-highfives
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.12
+      MemorySize: 248
+      Timeout: 10
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTableHighfives
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTableHighfives
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTableHighfives
+        - Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:Admin*
+                - cognito-idp:DescribeIdentityProvider
+                - cognito-idp:DescribeResourceServer
+                - cognito-idp:DescribeUserPool
+                - cognito-idp:DescribeUserPoolClient
+                - cognito-idp:DescribeUserPoolDomain
+                - cognito-idp:GetGroup
+                - cognito-idp:ListGroups
+                - cognito-idp:ListUserPoolClients
+                - cognito-idp:ListUsers
+                - cognito-idp:ListUsersInGroup
+                - cognito-idp:UpdateGroup
+              Resource: !GetAtt CognitoUserPool.Arn
+      Layers:
+        - !Ref AwsUtilLayer
+      Environment:
+        Variables:
+          DYNAMODBTABLEHIGHFIVES_TABLE_NAME: !Ref DynamoDBTableHighfives
+          DYNAMODBTABLEHIGHFIVES_TABLE_ARN: !GetAtt DynamoDBTableHighfives.Arn
+          COGNITOUSERPOOLCLIENT_USER_POOL_CLIENT_ID: !Ref CognitoUserPoolClient
+          DYNAMODBTABLEHIGHFIVES_TABLE_NAME_2: !Ref DynamoDBTableHighfives
+          DYNAMODBTABLEHIGHFIVES_TABLE_ARN_2: !GetAtt DynamoDBTableHighfives.Arn
+          COGNITOUSERPOOL_USER_POOL_ARN: !GetAtt CognitoUserPool.Arn
+      Events:
+        GetGivenEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SkyFiveApi
+            Path: /my/given
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuth
+        GetReceivedEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SkyFiveApi
+            Path: /my/received
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuth
+
+Metadata:
+  AWS::Composer::Groups:
+    Group:
+      Label: Backend
+      Members:
+        - SkyFiveApi
+        - SNSTopicSatEvents
+        - Group4
+        - Group2
+        - Group6
+        - Group5
+    Group2:
+      Label: Identity
+      Members:
+        - CognitoUserPool
+        - UserPoolDomain
+        - CognitoIdentityProviderGoogle
+        - CognitoUserPoolClient
+    Group3:
+      Label: Frontend
+      Members:
+        - CloudFrontOriginAccessControl
+        - WebsiteDistribution
+        - WebsiteBucket
+    Group4:
+      Label: DB
+      Members:
+        - DynamoDBTableSatTleCache
+        - DynamoDBTableHighfives
+        - DynamoDBTableSatTravellers
+    Group6:
+      Label: Layers
+      Members:
+        - AwsUtilLayer
+        - SatMathLayer
+        - SatDataLayer
+    Group5:
+      Label: Lambdas
+      Members:
+        - LambdaSatPathPredict
+        - LambdaUserGetTrackedSats
+        - LambdaHighfive
+        - LambdaGetSatTravellers
+        - LambdaUpdateSatRider
+        - LambdaNearby
+        - LambdaSatInfo
+        - LambdaGetHighfives
+
+Outputs:
+  SkyFiveApiUrl:
+    Description: API Gateway endpoint URL for dev stage
+    Value: !Sub https://${SkyFiveApi}.execute-api.${AWS::Region}.amazonaws.com/dev/
+
+  WebsiteUrl:
+    Description: CloudFront URL Website
+    Value: !Sub https://${WebsiteDistribution.DomainName}
+  WebsiteDistributionId:
+    Description: CloudFront Distribution ID for clearing cache
+    Value: !Ref WebsiteDistribution
+
+  CognitoDomainUrl:
+    Description: Base URL for Cognito Auth UI
+    Value: !Sub https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
+  CognitoAppClientId:
+    Description: Client ID for Cognito login
+    Value: !Ref CognitoUserPoolClient
+
+  LoginUrl:
+    Description: Full Login URL
+    Value: !Sub
+      - https://${AuthDomain}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${ClientId}&response_type=code&scope=email+openid+phone+profile&redirect_uri=https://${CloudFrontDomain}/${Uri}
+      - AuthDomain: !Ref UserPoolDomain
+        ClientId: !Ref CognitoUserPoolClient
+        CloudFrontDomain: !GetAtt WebsiteDistribution.DomainName
+        Uri: callback.html
+  LogoutUrl:
+    Description: Full Logout URL
+    Value: !Sub
+      - https://${AuthDomain}.auth.${AWS::Region}.amazoncognito.com/logout?client_id=${ClientId}&logout_uri=https://${CloudFrontDomain}/${Uri}
+      - AuthDomain: !Ref UserPoolDomain
+        ClientId: !Ref CognitoUserPoolClient
+        CloudFrontDomain: !GetAtt WebsiteDistribution.DomainName
+        Uri: logout.html
