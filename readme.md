@@ -61,8 +61,8 @@ SkyFive's Backend is built on **AWS** and designed as *fully serverless* infrast
    2. Edit your OAuth client.
    3. Add your Cognito User Pool domain to the **Authorized JavaScript origins** (e.g., `https://skyfive-<account-id>.auth.<region>.amazoncognito.com`).
    4. Add the Cognito callback endpoints to the **Authorized redirect URIs**:
-      * `https://skyfive-<account-id>.auth.<region>.amazoncognito.com/oauth2/idpresponse` *(or from step 3)*.
-      * `https://<your-cloudfront-domain>/callback.html` *(or from step 3)*.
+      * `https://skyfive-<account-id>.auth.<region>.amazoncognito.com/oauth2/idpresponse` *(or from step 2)*.
+      * `https://<your-cloudfront-domain>/callback.html` *(or from step 2)*.
 
 4. **Frontend Website Configuration**
    * Configure your frontend website with the **AWS API Gateway**'s base URL & configure the UI buttons (Login, Logout, Callback) to use the **Cognito & CloudFront URLs** *(from step 3 or from the AWS Console)*. 
